@@ -27,6 +27,14 @@ const PERMISSIVE_WORKSPACE = stubWorkspaceContext('/');
 
 let disposables: DisposableStore;
 
+function createGate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((release) => {
+    resolve = release;
+  });
+  return { promise, resolve };
+}
+
 function createTestEnv(home = '/home'): IHostEnvironment {
   return {
     _serviceBrand: undefined,
@@ -59,13 +67,15 @@ function buildTool(
   env: IHostEnvironment,
   workspace: ISessionWorkspaceContext,
   appFs: IHostFileSystem = fs,
+  editor?: IFileEditService,
 ): EditTool {
   const ix = createServices(disposables, {
     additionalServices: (reg) => {
       reg.defineInstance(IHostFileSystem, appFs);
       reg.defineInstance(IHostEnvironment, env);
       reg.defineInstance(ISessionWorkspaceContext, workspace);
-      reg.define(IFileEditService, FileEditService);
+      if (editor) reg.defineInstance(IFileEditService, editor);
+      else reg.define(IFileEditService, FileEditService);
     },
   });
   const runtimeValue = {
@@ -208,6 +218,164 @@ describe('EditTool', () => {
 
     expect(result.output).toContain('Replaced 1 occurrence');
     expect(writeText).toHaveBeenCalledWith('/tmp/a.txt', 'alpha gamma');
+  });
+
+  it('preserves independent concurrent edits from separate tools sharing the App editor', async () => {
+    let content = 'alpha\nbeta\n';
+    const entered = createGate();
+    const release = createGate();
+    const readText = vi.fn(async () => {
+      const snapshot = content;
+      if (readText.mock.calls.length === 1) {
+        entered.resolve();
+        await release.promise;
+      }
+      return snapshot;
+    });
+    const { fs } = createSpiedEditFs({
+      readText,
+      writeText: vi.fn(async (_path: string, value: string) => {
+        content = value;
+      }),
+    });
+    const editor = new FileEditService(fs);
+    const firstTool = buildTool(fs, createTestEnv(), PERMISSIVE_WORKSPACE, fs, editor);
+    const secondTool = buildTool(fs, createTestEnv(), PERMISSIVE_WORKSPACE, fs, editor);
+    const first = execute(firstTool, { path: '/tmp/a.txt', old_string: 'alpha', new_string: 'ALPHA' });
+    await entered.promise;
+    const second = execute(secondTool, { path: '/tmp/a.txt', old_string: 'beta', new_string: 'BETA' });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(readText).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+    }
+    const results = await Promise.all([first, second]);
+    expect(results.every((result) => !result.isError)).toBe(true);
+    expect(content).toBe('ALPHA\nBETA\n');
+  });
+
+  it('allows edits to different files while another edit is blocked', async () => {
+    const entered = createGate();
+    const release = createGate();
+    const { fs, writeText } = createSpiedEditFs({
+      readText: vi.fn(async (path: string) => {
+        if (path === '/tmp/a.txt') {
+          entered.resolve();
+          await release.promise;
+        }
+        return 'old';
+      }),
+    });
+    const editor = new FileEditService(fs);
+    const tool = buildTool(fs, createTestEnv(), PERMISSIVE_WORKSPACE, fs, editor);
+    const first = execute(tool, { path: '/tmp/a.txt', old_string: 'old', new_string: 'new' });
+    await entered.promise;
+    try {
+      const second = await execute(tool, { path: '/tmp/b.txt', old_string: 'old', new_string: 'new' });
+      expect(second.isError).toBeFalsy();
+      expect(writeText).toHaveBeenCalledWith('/tmp/b.txt', 'new');
+      expect(writeText).not.toHaveBeenCalledWith('/tmp/a.txt', 'new');
+    } finally {
+      release.resolve();
+      await first;
+    }
+  });
+
+  it('holds the file queue until writes complete and applies queued edits in order', async () => {
+    let content = 'alpha\nbeta\ngamma\n';
+    const entered = createGate();
+    const release = createGate();
+    const readText = vi.fn(async () => content);
+    const writeText = vi.fn(async (_path: string, value: string) => {
+      if (writeText.mock.calls.length === 1) {
+        entered.resolve();
+        await release.promise;
+      }
+      content = value;
+    });
+    const { fs } = createSpiedEditFs({ readText, writeText });
+    const editor = new FileEditService(fs);
+    const tools = Array.from({ length: 3 }, () =>
+      buildTool(fs, createTestEnv(), PERMISSIVE_WORKSPACE, fs, editor),
+    );
+    const first = execute(tools[0]!, { path: '/tmp/a.txt', old_string: 'alpha', new_string: 'ALPHA' });
+    await entered.promise;
+    const second = execute(tools[1]!, { path: '/tmp/a.txt', old_string: 'beta', new_string: 'BETA' });
+    const third = execute(tools[2]!, { path: '/tmp/a.txt', old_string: 'gamma', new_string: 'GAMMA' });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(readText).toHaveBeenCalledTimes(1);
+      expect(writeText).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+    }
+    expect((await Promise.all([first, second, third])).every((result) => !result.isError)).toBe(true);
+    expect(writeText.mock.calls.map((call) => call[1])).toEqual([
+      'ALPHA\nbeta\ngamma\n',
+      'ALPHA\nBETA\ngamma\n',
+      'ALPHA\nBETA\nGAMMA\n',
+    ]);
+    expect(content).toBe('ALPHA\nBETA\nGAMMA\n');
+  });
+
+  it('does not coordinate identical paths on independent runtime filesystems', async () => {
+    const entered = createGate();
+    const release = createGate();
+    const { fs: firstFs } = createSpiedEditFs({
+      readText: vi.fn(async () => {
+        entered.resolve();
+        await release.promise;
+        return 'old';
+      }),
+    });
+    const { fs: secondFs, writeText } = createSpiedEditFs({ readText: vi.fn(async () => 'old') });
+    const editor = new FileEditService(firstFs);
+    const firstTool = buildTool(firstFs, createTestEnv(), PERMISSIVE_WORKSPACE, firstFs, editor);
+    const secondTool = buildTool(secondFs, createTestEnv(), PERMISSIVE_WORKSPACE, firstFs, editor);
+    const first = execute(firstTool, { path: '/tmp/a.txt', old_string: 'old', new_string: 'new' });
+    await entered.promise;
+    try {
+      const second = await execute(secondTool, {
+        path: '/tmp/a.txt',
+        old_string: 'old',
+        new_string: 'new',
+      });
+      expect(second.isError).toBeFalsy();
+      expect(writeText).toHaveBeenCalledWith('/tmp/a.txt', 'new');
+    } finally {
+      release.resolve();
+      await first;
+    }
+  });
+
+  it.each(['read', 'write', 'replacement'] as const)('releases queued edits after a %s failure', async (failure) => {
+    const entered = createGate();
+    const release = createGate();
+    const readText = vi.fn(async () => {
+      if (readText.mock.calls.length === 1) {
+        entered.resolve();
+        await release.promise;
+        if (failure === 'read') throw new Error('read failed');
+        if (failure === 'replacement') return 'missing';
+      }
+      return 'old';
+    });
+    const writeText = vi.fn(async () => {
+      if (failure === 'write' && writeText.mock.calls.length === 1) throw new Error('write failed');
+    });
+    const { fs } = createSpiedEditFs({ readText, writeText });
+    const editor = new FileEditService(fs);
+    const tool = buildTool(fs, createTestEnv(), PERMISSIVE_WORKSPACE, fs, editor);
+    const args = { path: '/tmp/a.txt', old_string: 'old', new_string: 'new' };
+    const first = execute(tool, args);
+    await entered.promise;
+    const second = execute(tool, args);
+    release.resolve();
+    const results = await Promise.all([first, second]);
+    expect(results[0]?.isError).toBe(true);
+    expect(results[1]?.isError).toBeFalsy();
+    expect((await execute(tool, args)).isError).toBeFalsy();
   });
 
   it('executes against the selected runtime filesystem instead of the App filesystem', async () => {
